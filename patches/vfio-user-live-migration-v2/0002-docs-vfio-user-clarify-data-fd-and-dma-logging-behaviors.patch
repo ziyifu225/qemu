@@ -1,0 +1,57 @@
+From mboxrd@z Thu Jan  1 00:00:00 1970
+From: Hugo Komatsu <hugo.komatsu@nutanix.com>
+Date: Fri, 11 Sep 2026 14:19:25 +0000
+Subject: [PATCH v2 2/8] docs/vfio-user: clarify data_fd and DMA logging behaviors
+Message-ID: <20260911140710.2348139-3-hugo.komatsu@nutanix.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Specify that the data_fd field must be explicitly set to -1 by the
+server, rather than relying on client-side fixups.
+
+Clarify that the server must return an empty bitmap rather than
+an error when reporting dirty pages for unmapped or message-based
+DMA regions, as the client tracks these natively.
+
+Signed-off-by: Hugo Komatsu <hugo.komatsu@nutanix.com>
+Reviewed-by: John Levon <john.levon@nutanix.com>
+---
+ docs/interop/vfio-user.rst | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/docs/interop/vfio-user.rst b/docs/interop/vfio-user.rst
+index 73282cd2dd..17c0f82355 100644
+--- a/docs/interop/vfio-user.rst
++++ b/docs/interop/vfio-user.rst
+@@ -1712,9 +1712,10 @@ structured as follows:
+ | VFIO_DEVICE_STATE_PRE_COPY_P2P | 7     | (not used in vfio-user)                                             |
+ +--------------------------------+-------+---------------------------------------------------------------------+
+ 
+-* *data_fd* is unused in vfio-user, as the ``VFIO_USER_MIG_DATA_READ`` and
+-  ``VFIO_USER_MIG_DATA_WRITE`` messages are used instead for migration data
+-  transport.
++* *data_fd* must be set to -1 in both the request and the response. It
++  is unused in vfio-user, as the ``VFIO_USER_MIG_DATA_READ`` and
++  ``VFIO_USER_MIG_DATA_WRITE`` messages are used instead for migration
++  data transport.
+ 
+ Direct State Transitions
+ """"""""""""""""""""""""
+@@ -1846,6 +1847,11 @@ The bitmap is an array of u64s that holds the output bitmap, with 1 bit
+ reporting a *page_size* unit of IOVA. The bits outside of the requested range
+ must be zero.
+ 
++If the server cannot translate the requested IOVA range (e.g. because it
++is unmapped, or accessed via message-based DMA), the server must return
++an empty (zeroed) bitmap rather than returning an error. The client
++natively tracks dirty pages for message-based DMA operations.
++
+ The mapping of IOVA to bits is given by:
+ ``bitmap[(addr - iova)/page_size] & (1ULL << (addr % 64))``
+ 
+-- 
+2.39.3
+
+
+

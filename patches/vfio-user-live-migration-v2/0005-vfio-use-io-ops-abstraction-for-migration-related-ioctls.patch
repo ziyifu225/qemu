@@ -1,0 +1,329 @@
+From mboxrd@z Thu Jan  1 00:00:00 1970
+From: Hugo Komatsu <hugo.komatsu@nutanix.com>
+Date: Fri, 11 Sep 2026 14:19:30 +0000
+Subject: [PATCH v2 5/8] vfio: use io_ops abstraction for migration related ioctls
+Message-ID: <20260911140710.2348139-6-hugo.komatsu@nutanix.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The generic VFIO migration code in hw/vfio/migration.c issued read()
+and qemu_file_get_to_fd() directly, hardcoding the kernel as the only
+transport. Route these through the VFIODeviceIOOps table so an
+alternate transport (vfio-user) can supply its own implementations.
+
+Add three migration slots - get_precopy_info, mig_data_read, and
+mig_data_write_from_file - and guarded public wrappers that dispatch to
+the selected backend. Implement the kernel callbacks around the existing
+calls. vfio_query_precopy_size() and vfio_save_block() now take a
+VFIODevice so they can call the wrappers.
+
+This is a pure refactor: the kernel path is unchanged.
+
+Co-authored-by: Rafael Castillo <rafael@trfs.me>
+Signed-off-by: Hugo Komatsu <hugo.komatsu@nutanix.com>
+---
+ hw/vfio/device.c              | 64 +++++++++++++++++++++++++++++++++++
+ hw/vfio/migration.c           | 37 ++++++++++----------
+ include/hw/vfio/vfio-device.h | 45 ++++++++++++++++++++++++
+ 3 files changed, 127 insertions(+), 19 deletions(-)
+
+diff --git a/hw/vfio/device.c b/hw/vfio/device.c
+index b2123a0443..ddd7508359 100644
+--- a/hw/vfio/device.c
++++ b/hw/vfio/device.c
+@@ -30,8 +30,10 @@
+ #include "qemu/units.h"
+ #include "migration/cpr.h"
+ #include "migration/blocker.h"
++#include "migration/qemu-file.h"
+ #include "monitor/monitor.h"
+ #include "vfio-helpers.h"
++#include "vfio-migration-internal.h"
+ 
+ VFIODeviceList vfio_device_list =
+     QLIST_HEAD_INITIALIZER(vfio_device_list);
+@@ -576,6 +578,34 @@ int vfio_device_reset(VFIODevice *vbasedev)
+     return vbasedev->io_ops->device_reset(vbasedev);
+ }
+ 
++int vfio_device_get_precopy_info(VFIODevice *vbasedev,
++                                 struct vfio_precopy_info *info)
++{
++    if (!vbasedev->io_ops || !vbasedev->io_ops->get_precopy_info) {
++        return -EINVAL;
++    }
++    return vbasedev->io_ops->get_precopy_info(vbasedev, info);
++}
++
++ssize_t vfio_device_mig_data_read(VFIODevice *vbasedev, void *buf,
++                                  size_t buf_size)
++{
++    if (!vbasedev->io_ops || !vbasedev->io_ops->mig_data_read) {
++        return -EINVAL;
++    }
++    return vbasedev->io_ops->mig_data_read(vbasedev, buf, buf_size);
++}
++
++int vfio_device_mig_data_write_from_file(VFIODevice *vbasedev, QEMUFile *f,
++                                         size_t data_size)
++{
++    if (!vbasedev->io_ops ||
++        !vbasedev->io_ops->mig_data_write_from_file) {
++        return -EINVAL;
++    }
++    return vbasedev->io_ops->mig_data_write_from_file(vbasedev, f, data_size);
++}
++
+ int vfio_device_get_feature(VFIODevice *vbasedev,
+                             struct vfio_device_feature *feature)
+ {
+@@ -598,6 +628,37 @@ static int vfio_device_io_device_reset(VFIODevice *vbasedev)
+     return ret < 0 ? -errno : ret;
+ }
+ 
++static ssize_t vfio_device_io_mig_data_read(VFIODevice *vbasedev, void *buf,
++                                            size_t buf_size)
++{
++    VFIOMigration *migration = vbasedev->migration;
++    ssize_t ret;
++
++    ret = read(migration->data_fd, buf, buf_size);
++
++    return ret < 0 ? -errno : ret;
++}
++
++static int vfio_device_io_mig_data_write_from_file(VFIODevice *vbasedev,
++                                                   QEMUFile *f,
++                                                   size_t data_size)
++{
++    VFIOMigration *migration = vbasedev->migration;
++
++    return qemu_file_get_to_fd(f, migration->data_fd, data_size);
++}
++
++static int vfio_device_io_get_precopy_info(VFIODevice *vbasedev,
++                                           struct vfio_precopy_info *info)
++{
++    VFIOMigration *migration = vbasedev->migration;
++    int ret;
++
++    ret = ioctl(migration->data_fd, VFIO_MIG_GET_PRECOPY_INFO, info);
++
++    return ret < 0 ? -errno : ret;
++}
++
+ static int vfio_device_io_device_feature(VFIODevice *vbasedev,
+                                          struct vfio_device_feature *feature)
+ {
+@@ -678,6 +739,9 @@ static VFIODeviceIOOps vfio_device_io_ops_ioctl = {
+     .capabilities = VFIO_IO_CAP_DMA_BUF,
+ 
+     .device_reset = vfio_device_io_device_reset,
++    .mig_data_read = vfio_device_io_mig_data_read,
++    .mig_data_write_from_file = vfio_device_io_mig_data_write_from_file,
++    .get_precopy_info = vfio_device_io_get_precopy_info,
+     .device_feature = vfio_device_io_device_feature,
+     .get_region_info = vfio_device_io_get_region_info,
+     .get_irq_info = vfio_device_io_get_irq_info,
+diff --git a/hw/vfio/migration.c b/hw/vfio/migration.c
+index 25acb6dca4..257f9253aa 100644
+--- a/hw/vfio/migration.c
++++ b/hw/vfio/migration.c
+@@ -247,10 +247,9 @@ vfio_migration_set_state_or_reset(VFIODevice *vbasedev,
+ static int vfio_load_buffer(QEMUFile *f, VFIODevice *vbasedev,
+                             uint64_t data_size)
+ {
+-    VFIOMigration *migration = vbasedev->migration;
+     int ret;
+ 
+-    ret = qemu_file_get_to_fd(f, migration->data_fd, data_size);
++    ret = vfio_device_mig_data_write_from_file(vbasedev, f, data_size);
+     trace_vfio_load_state_device_data(vbasedev->name, data_size, ret);
+ 
+     return ret;
+@@ -369,20 +368,20 @@ static int vfio_query_stop_copy_size(VFIODevice *vbasedev)
+     return ret;
+ }
+ 
+-static int vfio_query_precopy_size(VFIOMigration *migration)
++static int vfio_query_precopy_size(VFIODevice *vbasedev)
+ {
+-    VFIODevice *vbasedev = migration->vbasedev;
++    VFIOMigration *migration = vbasedev->migration;
+     struct vfio_precopy_info precopy = {
+         .argsz = sizeof(precopy),
+     };
+     bool reinit = false;
+     int ret = 0;
+ 
+-    if (ioctl(migration->data_fd, VFIO_MIG_GET_PRECOPY_INFO, &precopy)) {
++    ret = vfio_device_get_precopy_info(vbasedev, &precopy);
++    if (ret) {
+         migration->precopy_init_size = 0;
+         migration->precopy_dirty_size = 0;
+-        ret = -errno;
+-        warn_report_once("VFIO device %s ioctl(VFIO_MIG_GET_PRECOPY_INFO) "
++        warn_report_once("VFIO device %s get_precopy_info "
+                          "failed (%d)", vbasedev->name, ret);
+     } else {
+         bool overflow;
+@@ -425,18 +424,20 @@ static int vfio_query_precopy_size(VFIOMigration *migration)
+ }
+ 
+ /* Returns the size of saved data on success and -errno on error */
+-static ssize_t vfio_save_block(QEMUFile *f, VFIOMigration *migration)
++static ssize_t vfio_save_block(QEMUFile *f, VFIODevice *vbasedev)
+ {
++    VFIOMigration *migration = vbasedev->migration;
+     ssize_t data_size;
+ 
+-    data_size = read(migration->data_fd, migration->data_buffer,
+-                     migration->data_buffer_size);
++    data_size = vfio_device_mig_data_read(vbasedev,
++                                          migration->data_buffer,
++                                          migration->data_buffer_size);
+     if (data_size < 0) {
+         /*
+          * Pre-copy emptied all the device state for now. For more information,
+          * please refer to the Linux kernel VFIO uAPI.
+          */
+-        if (errno == ENOMSG) {
++        if (data_size == -ENOMSG) {
+             if (!migration->event_precopy_empty_hit) {
+                 trace_vfio_save_block_precopy_empty_hit(migration->vbasedev->name);
+                 migration->event_precopy_empty_hit = true;
+@@ -444,7 +445,7 @@ static ssize_t vfio_save_block(QEMUFile *f, VFIOMigration *migration)
+             return 0;
+         }
+ 
+-        return -errno;
++        return data_size;
+     }
+     if (data_size == 0) {
+         return 0;
+@@ -599,7 +600,7 @@ static int vfio_save_setup(QEMUFile *f, void *opaque, Error **errp)
+                 return ret;
+             }
+ 
+-            vfio_query_precopy_size(migration);
++            vfio_query_precopy_size(vbasedev);
+             if (migrate_switchover_ack() && !migrate_switchover_ack_legacy()) {
+                 migration->request_switchover_ack = true;
+             }
+@@ -662,12 +663,10 @@ static void vfio_save_cleanup(void *opaque)
+ 
+ static void vfio_state_pending_sync(VFIODevice *vbasedev)
+ {
+-    VFIOMigration *migration = vbasedev->migration;
+-
+     vfio_query_stop_copy_size(vbasedev);
+ 
+     if (vfio_device_state_is_precopy(vbasedev)) {
+-        vfio_query_precopy_size(migration);
++        vfio_query_precopy_size(vbasedev);
+     }
+ }
+ 
+@@ -738,7 +737,7 @@ static int vfio_save_iterate(QEMUFile *f, void *opaque)
+         migration->event_save_iterate_started = true;
+     }
+ 
+-    data_size = vfio_save_block(f, migration);
++    data_size = vfio_save_block(f, vbasedev);
+     if (data_size < 0) {
+         return data_size;
+     }
+@@ -778,7 +777,7 @@ static int vfio_save_complete_precopy(QEMUFile *f, void *opaque)
+     }
+ 
+     do {
+-        data_size = vfio_save_block(f, vbasedev->migration);
++        data_size = vfio_save_block(f, vbasedev);
+         if (data_size < 0) {
+             return data_size;
+         }
+@@ -975,7 +974,7 @@ static void vfio_final_precopy_reinit_check(VFIODevice *vbasedev)
+         return;
+     }
+ 
+-    ret = vfio_query_precopy_size(migration);
++    ret = vfio_query_precopy_size(vbasedev);
+     if (ret) {
+         error_report("%s: Final precopy reinit check failed (err: %d)",
+                      vbasedev->name, ret);
+diff --git a/include/hw/vfio/vfio-device.h b/include/hw/vfio/vfio-device.h
+index 6dc596c9fc..f0add3fd84 100644
+--- a/include/hw/vfio/vfio-device.h
++++ b/include/hw/vfio/vfio-device.h
+@@ -202,6 +202,18 @@ struct VFIODeviceIOOps {
+      */
+     int (*device_reset)(VFIODevice *vdev);
+ 
++    /**
++     * @get_precopy_info
++     *
++     * Get information about pre-copy migration data transfer progress.
++     *
++     * @vdev: #VFIODevice to use
++     * @info: pointer to struct vfio_precopy_info to fill in
++     *
++     * Returns 0 on success or -errno.
++     */
++    int (*get_precopy_info)(VFIODevice *vdev, struct vfio_precopy_info *info);
++
+     /**
+      * @device_feature
+      *
+@@ -268,6 +280,33 @@ struct VFIODeviceIOOps {
+     int (*region_read)(VFIODevice *vdev, uint8_t nr, off_t off, uint32_t size,
+                        void *data);
+ 
++    /**
++     * @mig_data_read
++     *
++     * Read migration data from the device.
++     *
++     * @vdev: #VFIODevice to use
++     * @buf: buffer to read into
++     * @buf_size: maximum number of bytes to read
++     *
++     * Returns the number of bytes read on success or -errno.
++     */
++    ssize_t (*mig_data_read)(VFIODevice *vdev, void *buf, size_t buf_size);
++
++    /**
++     * @mig_data_write_from_file
++     *
++     * Write migration data to the device, reading the data from a QEMUFile.
++     *
++     * @vdev: #VFIODevice to use
++     * @f: source to read the migration data from
++     * @data_size: number of bytes to write
++     *
++     * Returns 0 on success or -errno.
++     */
++    int (*mig_data_write_from_file)(VFIODevice *vdev, QEMUFile *f,
++                                    size_t data_size);
++
+     /**
+      * @region_write
+      *
+@@ -299,6 +338,12 @@ bool vfio_device_get_host_iommu_quirk_bypass_ro(VFIODevice *vbasedev,
+                                                 uint32_t size);
+ 
+ int vfio_device_reset(VFIODevice *vbasedev);
++int vfio_device_get_precopy_info(VFIODevice *vbasedev,
++                                 struct vfio_precopy_info *info);
++ssize_t vfio_device_mig_data_read(VFIODevice *vbasedev, void *buf,
++                                  size_t buf_size);
++int vfio_device_mig_data_write_from_file(VFIODevice *vbasedev, QEMUFile *f,
++                                         size_t data_size);
+ int vfio_device_get_feature(VFIODevice *vbasedev,
+                             struct vfio_device_feature *feature);
+ 
+-- 
+2.39.3
+
+
+

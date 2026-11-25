@@ -1,0 +1,189 @@
+From mboxrd@z Thu Jan  1 00:00:00 1970
+From: Hugo Komatsu <hugo.komatsu@nutanix.com>
+Date: Fri, 11 Sep 2026 14:19:29 +0000
+Subject: [PATCH v2 4/8] vfio: route device_reset through io_ops
+Message-ID: <20260911140710.2348139-5-hugo.komatsu@nutanix.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Various subsystems across QEMU issue kernel ioctls directly for
+VFIO_DEVICE_RESET. Add a guarded vfio_device_reset() wrapper and route
+all callers through a new device_reset slot in VFIODeviceIOOps so an
+alternate transport such as vfio-user can supply its own implementation.
+
+Implement the kernel backend as a thin wrapper around the existing
+ioctl() call. This is a pure preparatory refactor: the kernel path is
+unchanged.
+
+Co-authored-by: Rafael Castillo <rafael@trfs.me>
+Signed-off-by: Hugo Komatsu <hugo.komatsu@nutanix.com>
+---
+ hw/vfio/ap.c                  |  4 ++--
+ hw/vfio/ccw.c                 |  2 +-
+ hw/vfio/device.c              | 20 +++++++++++++++++++-
+ hw/vfio/migration.c           |  7 ++++---
+ hw/vfio/pci.c                 |  4 ++--
+ include/hw/vfio/vfio-device.h | 12 ++++++++++++
+ 6 files changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/hw/vfio/ap.c b/hw/vfio/ap.c
+index 6e2a1223ea..52d67a01ee 100644
+--- a/hw/vfio/ap.c
++++ b/hw/vfio/ap.c
+@@ -288,10 +288,10 @@ static void vfio_ap_reset(DeviceState *dev)
+     int ret;
+     VFIOAPDevice *vapdev = VFIO_AP_DEVICE(dev);
+ 
+-    ret = ioctl(vapdev->vdev.fd, VFIO_DEVICE_RESET);
++    ret = vfio_device_reset(&vapdev->vdev);
+     if (ret) {
+         error_report("%s: failed to reset %s device: %s", __func__,
+-                     vapdev->vdev.name, strerror(errno));
++                     vapdev->vdev.name, strerror(-ret));
+     }
+ }
+ 
+diff --git a/hw/vfio/ccw.c b/hw/vfio/ccw.c
+index c3dc7c1962..054121b71d 100644
+--- a/hw/vfio/ccw.c
++++ b/hw/vfio/ccw.c
+@@ -241,7 +241,7 @@ static void vfio_ccw_reset(DeviceState *dev)
+ {
+     VFIOCCWDevice *vcdev = VFIO_CCW(dev);
+ 
+-    ioctl(vcdev->vdev.fd, VFIO_DEVICE_RESET);
++    vfio_device_reset(&vcdev->vdev);
+ }
+ 
+ static void vfio_ccw_crw_read(VFIOCCWDevice *vcdev)
+diff --git a/hw/vfio/device.c b/hw/vfio/device.c
+index 4f11959633..b2123a0443 100644
+--- a/hw/vfio/device.c
++++ b/hw/vfio/device.c
+@@ -568,6 +568,14 @@ bool vfio_device_get_host_iommu_quirk_bypass_ro(VFIODevice *vbasedev,
+     return false;
+ }
+ 
++int vfio_device_reset(VFIODevice *vbasedev)
++{
++    if (!vbasedev->io_ops || !vbasedev->io_ops->device_reset) {
++        return -EINVAL;
++    }
++    return vbasedev->io_ops->device_reset(vbasedev);
++}
++
+ int vfio_device_get_feature(VFIODevice *vbasedev,
+                             struct vfio_device_feature *feature)
+ {
+@@ -578,9 +586,18 @@ int vfio_device_get_feature(VFIODevice *vbasedev,
+ }
+ 
+ /*
+- * Traditional ioctl() based io
++ * VFIODeviceIOOps implementation for the kernel VFIO backend.
+  */
+ 
++static int vfio_device_io_device_reset(VFIODevice *vbasedev)
++{
++    int ret;
++
++    ret = ioctl(vbasedev->fd, VFIO_DEVICE_RESET);
++
++    return ret < 0 ? -errno : ret;
++}
++
+ static int vfio_device_io_device_feature(VFIODevice *vbasedev,
+                                          struct vfio_device_feature *feature)
+ {
+@@ -660,6 +677,7 @@ static int vfio_device_io_region_write(VFIODevice *vbasedev, uint8_t index,
+ static VFIODeviceIOOps vfio_device_io_ops_ioctl = {
+     .capabilities = VFIO_IO_CAP_DMA_BUF,
+ 
++    .device_reset = vfio_device_io_device_reset,
+     .device_feature = vfio_device_io_device_feature,
+     .get_region_info = vfio_device_io_get_region_info,
+     .get_irq_info = vfio_device_io_get_irq_info,
+diff --git a/hw/vfio/migration.c b/hw/vfio/migration.c
+index 6db4c2a216..25acb6dca4 100644
+--- a/hw/vfio/migration.c
++++ b/hw/vfio/migration.c
+@@ -142,7 +142,7 @@ int vfio_migration_set_state(VFIODevice *vbasedev,
+     struct vfio_device_feature *feature = (struct vfio_device_feature *)buf;
+     struct vfio_device_feature_mig_state *mig_state =
+         (struct vfio_device_feature_mig_state *)feature->data;
+-    int ret;
++    int ret, reset_ret;
+     g_autofree char *error_prefix =
+         g_strdup_printf("%s: Failed setting device state to %s.",
+                         vbasedev->name, mig_state_to_str(new_state));
+@@ -219,9 +219,10 @@ int vfio_migration_set_state(VFIODevice *vbasedev,
+     return 0;
+ 
+ reset_device:
+-    if (ioctl(vbasedev->fd, VFIO_DEVICE_RESET)) {
++    reset_ret = vfio_device_reset(vbasedev);
++    if (reset_ret) {
+         hw_error("%s: Failed resetting device, err: %s", vbasedev->name,
+-                 strerror(errno));
++                 strerror(-reset_ret));
+     }
+ 
+     vfio_migration_set_device_state(vbasedev, VFIO_DEVICE_STATE_RUNNING);
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index 428ab2f069..73b4a93fca 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -3785,7 +3785,7 @@ static void vfio_pci_reset(DeviceState *dev)
+ 
+     if (vdev->vbasedev.reset_works &&
+         (vdev->has_flr || !vdev->has_pm_reset) &&
+-        !ioctl(vdev->vbasedev.fd, VFIO_DEVICE_RESET)) {
++        !vfio_device_reset(&vdev->vbasedev)) {
+         trace_vfio_pci_reset_flr(vdev->vbasedev.name);
+         goto post_reset;
+     }
+@@ -3797,7 +3797,7 @@ static void vfio_pci_reset(DeviceState *dev)
+ 
+     /* If nothing else works and the device supports PM reset, use it */
+     if (vdev->vbasedev.reset_works && vdev->has_pm_reset &&
+-        !ioctl(vdev->vbasedev.fd, VFIO_DEVICE_RESET)) {
++        !vfio_device_reset(&vdev->vbasedev)) {
+         trace_vfio_pci_reset_pm(vdev->vbasedev.name);
+         goto post_reset;
+     }
+diff --git a/include/hw/vfio/vfio-device.h b/include/hw/vfio/vfio-device.h
+index 8472420d3f..6dc596c9fc 100644
+--- a/include/hw/vfio/vfio-device.h
++++ b/include/hw/vfio/vfio-device.h
+@@ -191,6 +191,17 @@ struct VFIODeviceIOOps {
+      */
+     uint64_t capabilities;
+ 
++    /**
++     * @device_reset
++     *
++     * Perform a device reset.
++     *
++     * @vdev: #VFIODevice to use
++     *
++     * Returns 0 on success or -errno.
++     */
++    int (*device_reset)(VFIODevice *vdev);
++
+     /**
+      * @device_feature
+      *
+@@ -287,6 +298,7 @@ bool vfio_device_get_host_iommu_quirk_bypass_ro(VFIODevice *vbasedev,
+                                                 uint32_t type, void *caps,
+                                                 uint32_t size);
+ 
++int vfio_device_reset(VFIODevice *vbasedev);
+ int vfio_device_get_feature(VFIODevice *vbasedev,
+                             struct vfio_device_feature *feature);
+ 
+-- 
+2.39.3
+
+
+

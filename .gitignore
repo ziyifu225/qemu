@@ -19,4 +19,6 @@ GTAGS
 *.depend_raw
 *.swp
 *.patch
+# Keep archived mailing-list patches under version control.
+!/patches/**/*.patch
 *.gcov
