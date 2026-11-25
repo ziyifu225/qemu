@@ -1,0 +1,8 @@
+0001-vfio-user-add-live-migration-to-vfio-user-protocol-specification.patch
+0002-docs-vfio-user-clarify-data-fd-and-dma-logging-behaviors.patch
+0003-vfio-route-device-feature-through-io-ops.patch
+0004-vfio-route-device-reset-through-io-ops.patch
+0005-vfio-use-io-ops-abstraction-for-migration-related-ioctls.patch
+0006-vfio-user-enable-dma-logging-for-dirty-page-tracking.patch
+0007-vfio-user-implement-mig-data-read-write-socket-operations.patch
+0008-vfio-user-enable-live-migration-for-pci-devices.patch
